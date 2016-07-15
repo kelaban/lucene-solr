@@ -17,6 +17,7 @@
 package org.apache.solr.cloud;
 
 import org.apache.lucene.util.LuceneTestCase.Slow;
+import org.apache.solr.client.solrj.SolrClient;
 import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.SolrRequest;
 import org.apache.solr.client.solrj.SolrServerException;
@@ -30,11 +31,15 @@ import org.apache.solr.common.cloud.Replica;
 import org.apache.solr.common.cloud.Slice;
 import org.apache.solr.common.cloud.ZkStateReader;
 import org.apache.solr.common.params.CollectionParams.CollectionAction;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.StrUtils;
 import org.apache.solr.common.params.ModifiableSolrParams;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
@@ -49,10 +54,18 @@ public class SyncSliceTest extends AbstractFullDistribZkTestBase {
   private boolean success = false;
 
   @Override
+  public void distribSetUp() throws Exception {
+    System.setProperty("solr.directoryFactory", "solr.StandardDirectoryFactory");
+    
+    super.distribSetUp();
+  }
+  
+  @Override
   public void distribTearDown() throws Exception {
     if (!success) {
       printLayoutOnTearDown = true;
     }
+    
     super.distribTearDown();
   }
 
@@ -61,8 +74,117 @@ public class SyncSliceTest extends AbstractFullDistribZkTestBase {
     sliceCount = 1;
     fixShardCount(TEST_NIGHTLY ? 7 : 4);
   }
+  
+  void assertSync(SolrClient client, int numVersions, boolean expectedResult, String... syncWith) throws IOException, SolrServerException {
+    QueryRequest qr = new QueryRequest(params("qt","/get", "getVersions",Integer.toString(numVersions), "sync", StrUtils.join(Arrays.asList(syncWith), ',')));
+    NamedList rsp = client.request(qr);
+    assertEquals(expectedResult, (Boolean) rsp.get("sync"));
+  }
+  
+  @Test
+  public void test2() throws Exception {
+    handle.clear();
+    handle.put("timestamp", SKIPVAL);
+    
+    waitForThingsToLevelOut(30);
+
+    del("*:*");
+    List<CloudJettyRunner> skipServers = new ArrayList<>();
+    
+    int docId = 0;
+    indexDoc(skipServers, id, docId++, i1, 50, tlong, 50, t1,
+        "to come to the aid of their country.");
+    
+    indexDoc(skipServers, id, docId++, i1, 50, tlong, 50, t1,
+        "old haven was blue.");
+    
+    indexDoc(skipServers, id, docId++, i1, 50, tlong, 50, t1,
+        "but the song was fancy.");
+    
+    commit();
+    
+    waitForRecoveriesToFinish(false);
+    
+    String shardFailMessage = checkShardConsistency("shard1", false, false);
+    assertNull(shardFailMessage);
+    
+    assertSync(cloudClient, 100, true, "fingerprint", "true");
+    
+    // kill the leader - new leader could have all the docs or be missing one
+    CloudJettyRunner leaderJetty = shardToLeaderJetty.get("shard1");
+    
+    skipServers = getRandomOtherJetty(leaderJetty, null); // but not the leader
+    
+    indexDoc(skipServers, id,docId++, i1, 50, tlong, 50, t1,
+        "under the moon and over the lake");
+    
+    
+    
+    commit();
+    
+    waitForRecoveriesToFinish(false);
+
+    // shard should be inconsistent
+    shardFailMessage = checkShardConsistency("shard1", true, false);
+    assertNotNull(shardFailMessage);
+    
+    ModifiableSolrParams params = new ModifiableSolrParams();
+    params.set("action", CollectionAction.SYNCSHARD.toString());
+    params.set("collection", "collection1");
+    params.set("shard", "shard1");
+    SolrRequest request = new QueryRequest(params);
+    request.setPath("/admin/collections");
+    
+    String baseUrl = ((HttpSolrClient) shardToJetty.get("shard1").get(2).client.solrClient)
+        .getBaseURL();
+    baseUrl = baseUrl.substring(0, baseUrl.length() - "collection1".length());
+    
+    try (HttpSolrClient baseClient = getHttpSolrClient(baseUrl)) {
+      // we only set the connect timeout, not so timeout
+      baseClient.setConnectionTimeout(30000);
+      baseClient.request(request);
+    }
+
+    waitForThingsToLevelOut(15);
+    
+    checkShardConsistency(false, true);
+    
+    assertSync(cloudClient, 100, true, "fingerprint", "true");
+   /* 
+    long cloudClientDocs = cloudClient.query(new SolrQuery("*:*")).getResults().getNumFound();
+    assertEquals(4, cloudClientDocs);
+    
+    
+
+    
+    chaosMonkey.killJetty(skipServers.get(0));
+    
+    Thread.sleep(3000);
+    
+    waitForNoShardInconsistency();
+    
+    Thread.sleep(1000);
+    
+    checkShardConsistency(false, true);
+    
+    indexDoc(skipServers, id,docId++, i1, 50, tlong, 50, t1,
+        "under the moon and over the lake");
+    
+    commit();
+    
+    cloudClientDocs = cloudClient.query(new SolrQuery("*:*")).getResults().getNumFound();
+    assertEquals(5, cloudClientDocs);
+    
+    // bring back dead node
+    ChaosMonkey.start(skipServers.get(0).jetty); // he is not the leader anymore
+    
+    waitTillAllNodesActive();
+    
+    */
+  }
 
   @Test
+  @Ignore
   public void test() throws Exception {
     
     handle.clear();

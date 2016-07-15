@@ -205,6 +205,8 @@
   <requestHandler name="standard" class="solr.StandardRequestHandler">
     <bool name="httpCaching">true</bool>
   </requestHandler>
+  
+  <requestHandler name="/replication" class="whatever" />
 
   <requestHandler name="dismax" class="solr.SearchHandler" >
     <lst name="defaults">
