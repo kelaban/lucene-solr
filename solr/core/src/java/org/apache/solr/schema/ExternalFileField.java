@@ -59,7 +59,7 @@ import org.apache.solr.uninverting.UninvertingReader.Type;
 public class ExternalFileField extends FieldType implements SchemaAware {
   private FieldType ftype;
   private String keyFieldName;
-  private IndexSchema schema;
+  protected IndexSchema schema;
   private float defVal;
 
   @Override
