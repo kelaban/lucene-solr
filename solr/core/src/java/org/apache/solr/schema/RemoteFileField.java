@@ -18,21 +18,28 @@ package org.apache.solr.schema;
 
 import static org.apache.solr.update.processor.DistributedUpdateProcessor.DISTRIB_FROM;
 
-import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.lang.invoke.MethodHandles;
+import java.net.MalformedURLException;
 import java.net.URL;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.zip.GZIPInputStream;
 
 import org.apache.commons.io.IOUtils;
+import org.apache.lucene.analysis.util.ResourceLoader;
+import org.apache.lucene.analysis.util.ResourceLoaderAware;
 import org.apache.solr.client.solrj.SolrRequest.METHOD;
 import org.apache.solr.client.solrj.impl.HttpSolrClient;
 import org.apache.solr.client.solrj.request.GenericSolrRequest;
@@ -45,78 +52,105 @@ import org.apache.solr.common.cloud.ZkCoreNodeProps;
 import org.apache.solr.common.cloud.ZooKeeperException;
 import org.apache.solr.common.params.CommonParams;
 import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.util.NamedList;
 import org.apache.solr.core.CoreDescriptor;
 import org.apache.solr.core.PluginBag;
 import org.apache.solr.core.SolrCore;
+import org.apache.solr.core.SolrResourceLoader;
 import org.apache.solr.handler.RequestHandlerBase;
 import org.apache.solr.handler.RequestHandlerUtils;
 import org.apache.solr.handler.UpdateRequestHandler;
 import org.apache.solr.request.SolrQueryRequest;
 import org.apache.solr.request.SolrRequestHandler;
 import org.apache.solr.response.SolrQueryResponse;
+import org.apache.solr.rest.BaseSolrResource;
+import org.apache.solr.rest.ManagedResource;
+import org.apache.solr.rest.ManagedResourceObserver;
+import org.apache.solr.rest.ManagedResourceStorage.StorageIO;
 import org.apache.solr.search.function.FileFloatSource;
 import org.apache.solr.update.SolrCmdDistributor.Node;
 import org.apache.solr.update.SolrCmdDistributor.StdNode;
-import org.apache.solr.update.processor.UpdateRequestProcessor;
 import org.apache.solr.update.UpdateShardHandler;
+import org.apache.solr.update.processor.UpdateRequestProcessor;
 import org.apache.solr.util.plugin.SolrCoreAware;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class RemoteFileField extends ExternalFileField {
-  private AtomicReference<List<SchemaField>> remoteFileFields = new AtomicReference<List<SchemaField>>(Collections.emptyList());
- 
+public class RemoteFileField extends ExternalFileField implements ResourceLoaderAware, ManagedResourceObserver {
+  private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+
+  private List<SchemaField> remoteFileFields = Collections.emptyList();
+  private RemoteFileFieldManager resourceManager = null;
+  
+  
+  //This is called when schema is loaded. Use this time to cache all the SchemaFields which are wired
+  //to the instance of this FieldType
   @Override
   public void inform(IndexSchema schema) {
     super.inform(schema);
     // TODO does this get call on schema reload? -- verify this behavior
     
-    remoteFileFields.set(rffs(schema));
-    
-    downloadAll();
+    remoteFileFields = schema
+      .getFields()
+      .values()
+      .stream()
+      .filter(sf -> sf.getType() == this)
+      .collect(Collectors.toList());
   }
   
-  private void downloadAll() {
-    for (SchemaField field: remoteFileFields.get()) {
+  
+  //Called once the managed resources have been loaded
+  //Use this time to cache the reference to the resource manager
+  @Override
+  public void onManagedResourceInitialized(NamedList<?> args, ManagedResource res) throws SolrException {
+    resourceManager = (RemoteFileFieldManager) res;
+  }
+  
+
+  @Override     
+  public void inform(ResourceLoader loader) throws IOException {
+    SolrResourceLoader solrResourceLoader = (SolrResourceLoader)loader;
+    
+    // here we want to register that we need to be managed
+    // at a specified path and the ManagedResource impl class
+    // that should be used to manage this component
+    solrResourceLoader.getManagedResourceRegistry().
+      registerManagedResource("/schema/remote-files/"+typeName, RemoteFileFieldManager.class, this);
+  }
+  
+  private synchronized void downloadAll() {
+    log.info("Downloading all remote field files");
+    for (SchemaField field: remoteFileFields) {
       try {
         downloadFile(schema, field);
       } catch (Exception e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Unable to download remote file for '" + field.getName() + "'");
+        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Unable to download remote file for '" + field.getName() + "'", e);
       }
     }
   }
   
-  public static List<SchemaField> rffs(IndexSchema schema) {
-    List<SchemaField> next = new ArrayList<SchemaField>();
+  private synchronized void downloadFile(IndexSchema schema, SchemaField sf) throws Exception {
+    Optional<RemoteFile> rf = resourceManager.getManagedFileURL(sf.getName());
     
-    for (SchemaField field : schema.getFields().values()) {
-      FieldType type = field.getType();
-      if (type instanceof RemoteFileField) {
-        next.add(field);
-      }
-    }
-      
-    return next;
-  }
-  
-  private void downloadFile(IndexSchema schema, SchemaField sf) throws Exception {
-    String surl = (String) sf.getArgs().get("url");
-    
-    if(null == surl) {
-      throw new RuntimeException("No url specified for field '" + sf.getName() + "'");
+    if(!rf.isPresent()) {
+      log.warn("No url specified for {}", sf.getName());
+      return;
     }
     
-    URL url = new URL(surl);
+    Path efp = externalFieldPath(schema, sf);
+    log.info("Trying to download remote file from {} to {}", rf.get().url.toString(), efp.toAbsolutePath().toString());
     
-    try(FileOutputStream os = new FileOutputStream(externalFieldFile(schema, sf));
-        InputStream is = url.openStream();)
+    
+    //TODO fall back to local version of file on startup? -- retry?
+    try(FileOutputStream os = new FileOutputStream(efp.toFile());
+        InputStream is = rf.get().gzipped ? new GZIPInputStream(rf.get().url.openStream()) : rf.get().url.openStream();)
     {
       IOUtils.copy(is, os);
     }
   }
   
-  private File externalFieldFile(IndexSchema schema, SchemaField sf) {
-    return Paths.get(schema.getResourceLoader().getDataDir(), "external_" + sf.getName()).toFile();
+  private Path externalFieldPath(IndexSchema schema, SchemaField sf) {
+    return Paths.get(schema.getResourceLoader().getDataDir(), "external_" + sf.getName());
   }
 
   public static class DownloadRemoteFilesRequestHandler extends RequestHandlerBase implements SolrCoreAware {
@@ -131,10 +165,20 @@ public class RemoteFileField extends ExternalFileField {
       CoreDescriptor coreDesc = req.getCore().getCoreDescriptor();
       boolean zkEnabled = coreDesc.getCoreContainer().isZooKeeperAware();
       
+      //Do local first
       if( !zkEnabled || false == req.getParams().getBool(CommonParams.DISTRIB, true) ) {
+        List<RemoteFileField> rffs = 
+          req
+            .getSchema()
+            .getFields()
+            .values()
+            .stream()
+            .filter(sf -> sf.getType() instanceof RemoteFileField)
+            .map(sf -> (RemoteFileField)sf.getType())
+            .collect(Collectors.toList());
         
-        for(SchemaField sf: rffs(req.getSchema())) {
-          ((RemoteFileField)sf.getType()).downloadAll();
+        for(RemoteFileField rff: rffs) {
+          rff.downloadAll();
         }
         
         return;
@@ -151,7 +195,7 @@ public class RemoteFileField extends ExternalFileField {
           coreDesc.getCoreContainer().getZkController().getBaseUrl(), 
           req.getCore().getName()));
       
-      // TODO make concurrent
+      // TODO make parallel
       for(Node n: nodes) {
         submit(handler, n, params);
       }
@@ -234,7 +278,118 @@ public class RemoteFileField extends ExternalFileField {
         throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
             "The DownloadRemoteFilesRequestHandler needs to be registered to a path.");
       }
+      
+      
+      // This is a huge hack !! there is a race condition in being able to get the dataDir from resource loader
+      // IT doesn't be come available into SolrCoreAware's are trigger
+      // Unfortunately you can't implement SolrCoreAware unless a SubType of a specific class, one of them being a RequestHandler
+      // If there is another way to get the data dir with the information provided to the FieldType above, this can be changed
+      List<RemoteFileField> rffs = 
+          core.getLatestSchema()
+            .getFields()
+            .values()
+            .stream()
+            .filter(sf -> sf.getType() instanceof RemoteFileField)
+            .map(sf -> (RemoteFileField)sf.getType())
+            .collect(Collectors.toList());
+        
+        for(RemoteFileField rff: rffs) {
+          rff.downloadAll();
+        }
     }
+  }
+  
+  private static class RemoteFile {
+    public final URL url;
+    public final boolean gzipped;
+    
+    public RemoteFile(URL url, boolean gzipped) {
+      this.url = url;
+      this.gzipped = gzipped;
+    }
+    
+  }
+  
+  public static class RemoteFileFieldManager extends ManagedResource implements ManagedResource.ChildResourceSupport
+  {
+    Map<String, RemoteFile> managedFiles = new HashMap<String, RemoteFile>();
+
+    public RemoteFileFieldManager(String resourceId, SolrResourceLoader loader, StorageIO storageIO)
+        throws SolrException {
+      super(resourceId, loader, storageIO);
+    }
+
+    @Override
+    protected void onManagedDataLoadedFromStorage(NamedList<?> managedInitArgs, Object managedData)
+        throws SolrException {
+      updateManagedData(managedData, true);
+    }
+
+    @Override
+    protected Object applyUpdatesToManagedData(Object updates) {
+      return updateManagedData(updates, false) ? managedFiles.entrySet().stream().collect(Collectors.toMap(e -> e.getKey(), e -> e.getValue().toString())) : null;
+    }
+    
+    @SuppressWarnings("unchecked")
+    private synchronized boolean updateManagedData(Object managedData, boolean clearCurrentData) {
+      boolean madeChanges = false;
+      Map<String, RemoteFile> nextManagedFiles = clearCurrentData ? new HashMap<String, RemoteFile>() : managedFiles;
+      
+      if (managedData != null) {
+        
+        Map<String,Object> storedFileUrls = cast(managedData, Map.class, () -> "the top level argument");
+        
+        for(Map.Entry<String,Object> e: storedFileUrls.entrySet()) {
+          Map<String,Object> params = cast(e.getValue(), Map.class, () -> e.getKey());
+          
+          String surl = cast(params.get("url"), String.class, () -> e.getKey() + ".url");
+          
+          boolean gzipped = Boolean.valueOf(params.getOrDefault("gzipped", false).toString());
+          
+          try {
+            URL url = new URL((String)surl);
+            
+            //TODO gzipped thing
+            RemoteFile oldRemote = nextManagedFiles.put(e.getKey(), new RemoteFile(url, gzipped));
+            madeChanges = madeChanges ? true : oldRemote == null;
+          } catch (MalformedURLException err) {
+            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, 
+                "RemoteFileFieldManager unabled to parse url for '" +e.getKey()+"' and value '"+(String)surl+"'", err);
+          }
+          
+        }
+      }
+      
+      managedFiles = nextManagedFiles;
+      
+      return madeChanges;
+    }
+    
+    private <T> T cast(Object o, Class<T> clzz, Supplier<String> errDesc) {
+      if(clzz.isInstance(o)) {
+        return clzz.cast(o);
+      }
+      
+      throw new SolrException(
+          SolrException.ErrorCode.SERVER_ERROR, 
+          String.format("RemoteFileFieldManager was expecting a '%s' for '%s' but got '%s'" , 
+              clzz.getName(), errDesc.get(), o.getClass().getName()));
+    }
+
+    @Override
+    public void doDeleteChild(BaseSolrResource endpoint, String childId) {
+      managedFiles.remove(childId);
+    }
+
+    @Override
+    public void doGet(BaseSolrResource endpoint, String childId) {
+      endpoint.getSolrResponse().add("files", getManagedFileURL(childId).map(u -> u.toString()).orElse(null));
+    }
+    
+    public Optional<RemoteFile> getManagedFileURL(String fieldName) {
+      return Optional.ofNullable(managedFiles.get(fieldName));
+    }
+    
   }
 
 }
