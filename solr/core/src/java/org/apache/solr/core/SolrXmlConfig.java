@@ -367,6 +367,9 @@ public class SolrXmlConfig {
         case "nodeName":
           builder.setNodeName(value);
           break;
+        case "zkIsTruth":
+          builder.setZkIsTruth(Boolean.parseBoolean(value));
+          break;
         case "zkACLProvider":
           builder.setZkACLProviderClass(value);
           break;

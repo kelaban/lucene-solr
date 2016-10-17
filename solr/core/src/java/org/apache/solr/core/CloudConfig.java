@@ -51,11 +51,13 @@ public class CloudConfig {
   private final boolean createCollectionCheckLeaderActive;
   
   private final String nodeName;
+  
+  private final boolean zkIsTruth;
 
   CloudConfig(String zkHost, int zkClientTimeout, int hostPort, String hostName, String hostContext, boolean useGenericCoreNames, 
               int leaderVoteWait, int leaderConflictResolveWait, int autoReplicaFailoverWaitAfterExpiration, 
               int autoReplicaFailoverWorkLoopDelay, int autoReplicaFailoverBadNodeExpiration, String zkCredentialsProviderClass, 
-              String zkACLProviderClass, int createCollectionWaitTimeTillActive, boolean createCollectionCheckLeaderActive, String nodeName) {
+              String zkACLProviderClass, int createCollectionWaitTimeTillActive, boolean createCollectionCheckLeaderActive, String nodeName, boolean zkIsTruth) {
     this.zkHost = zkHost;
     this.zkClientTimeout = zkClientTimeout;
     this.hostPort = hostPort;
@@ -72,11 +74,15 @@ public class CloudConfig {
     this.createCollectionWaitTimeTillActive = createCollectionWaitTimeTillActive;
     this.createCollectionCheckLeaderActive = createCollectionCheckLeaderActive;
     this.nodeName = nodeName;
+    this.zkIsTruth = zkIsTruth;
 
     if (this.hostPort == -1)
       throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "'hostPort' must be configured to run SolrCloud");
     if (this.hostContext == null)
       throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "'hostContext' must be configured to run SolrCloud");
+    
+    if(this.zkIsTruth && (null == this.nodeName || this.nodeName.isEmpty()))
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "'zkIsTruth' cannot be used without setting 'nodeName'");
   }
 
   public String getZkHost() {
@@ -142,6 +148,10 @@ public class CloudConfig {
   public String getNodeName() {
     return nodeName;
   }
+  
+  public boolean isZkTruth() {
+    return zkIsTruth;
+  }
 
   public static class CloudConfigBuilder {
 
@@ -172,6 +182,7 @@ public class CloudConfig {
     private int createCollectionWaitTimeTillActive = DEFAULT_CREATE_COLLECTION_ACTIVE_WAIT;
     private boolean createCollectionCheckLeaderActive = DEFAULT_CREATE_COLLECTION_CHECK_LEADER_ACTIVE;
     private String nodeName = null;
+    private boolean zkIsTruth = false;
 
     public CloudConfigBuilder(String hostName, int hostPort) {
       this(hostName, hostPort, null);
@@ -248,11 +259,16 @@ public class CloudConfig {
       return this;
     }
     
+    public CloudConfigBuilder setZkIsTruth(boolean zkIsTruth) {
+      this.zkIsTruth = zkIsTruth;
+      return this;
+    }
+    
     public CloudConfig build() {
       return new CloudConfig(zkHost, zkClientTimeout, hostPort, hostName, hostContext, useGenericCoreNames, leaderVoteWait, 
                              leaderConflictResolveWait, autoReplicaFailoverWaitAfterExpiration, autoReplicaFailoverWorkLoopDelay, 
                              autoReplicaFailoverBadNodeExpiration, zkCredentialsProviderClass, zkACLProviderClass, createCollectionWaitTimeTillActive,
-                             createCollectionCheckLeaderActive, nodeName);
+                             createCollectionCheckLeaderActive, nodeName, zkIsTruth);
     }
   }
 }

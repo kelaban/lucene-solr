@@ -45,6 +45,7 @@ import org.apache.solr.client.solrj.impl.SolrHttpClientContextBuilder.AuthScheme
 import org.apache.solr.client.solrj.impl.SolrHttpClientContextBuilder.CredentialsProviderProvider;
 import org.apache.solr.client.solrj.util.SolrIdentifierValidator;
 import org.apache.solr.cloud.Overseer;
+import org.apache.solr.cloud.ZkAwareCoreLocator;
 import org.apache.solr.cloud.ZkController;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrException.ErrorCode;
@@ -233,11 +234,11 @@ public class CoreContainer {
   }
 
   public CoreContainer(NodeConfig config, Properties properties) {
-    this(config, properties, new CorePropertiesLocator(config.getCoreRootDirectory()));
+    this(config, properties, getDefaultCoresLocator(config));
   }
 
   public CoreContainer(NodeConfig config, Properties properties, boolean asyncSolrCoreLoad) {
-    this(config, properties, new CorePropertiesLocator(config.getCoreRootDirectory()), asyncSolrCoreLoad);
+    this(config, properties, getDefaultCoresLocator(config), asyncSolrCoreLoad);
   }
 
   public CoreContainer(NodeConfig config, Properties properties, CoresLocator locator) {
@@ -251,6 +252,12 @@ public class CoreContainer {
     this.coresLocator = locator;
     this.containerProperties = new Properties(properties);
     this.asyncSolrCoreLoad = asyncSolrCoreLoad;
+  }
+  
+  private static CoresLocator getDefaultCoresLocator(NodeConfig config) {
+    return config.getCloudConfig().isZkTruth() ? 
+        new ZkAwareCoreLocator(config.getCoreRootDirectory()) : 
+        new CorePropertiesLocator(config.getCoreRootDirectory());
   }
 
   private synchronized void initializeAuthorizationPlugin(Map<String, Object> authorizationConf) {
