@@ -17,6 +17,7 @@
 package org.apache.solr.index;
 
 import java.util.Random;
+import java.util.function.IntUnaryOperator;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.DirectoryReader;
@@ -32,10 +33,13 @@ import org.apache.solr.schema.IndexSchema;
 import org.apache.solr.schema.SchemaField;
 import org.apache.solr.search.SolrIndexSearcher;
 import org.apache.solr.util.RefCounted;
+import org.apache.solr.util.TestHarness;
 import org.junit.After;
 import org.junit.Before;
 
 public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
+
+  private static String ID_FIELD = "id";
   private static String TEST_FIELD = "string_add_dv_later";
 
   @After
@@ -52,7 +56,7 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
     Random rand = random();
     
     for(int i=0; i < 100; i++) {
-      assertU(adoc("id", String.valueOf(i), TEST_FIELD, String.valueOf(i)));
+      assertU(adoc(ID_FIELD, String.valueOf(i), TEST_FIELD, String.valueOf(i)));
       
       if(rand.nextBoolean()) {
         assertU(commit());
@@ -62,7 +66,7 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
     assertU(commit());
     
     // Assert everything has been indexed and there are no docvalues
-    withNewRawReader(topReader -> {
+    withNewRawReader(h, topReader -> {
       assertEquals(100, topReader.numDocs());
 
       final FieldInfos infos = MultiFields.getMergedFieldInfos(topReader);
@@ -72,12 +76,12 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
     });
     
     
-    addDocValuesTo(TEST_FIELD);
+    addDocValuesTo(h, TEST_FIELD);
     
     
     // Add some more documents with doc values turned on including updating some
     for(int i=90; i < 110; i++) {
-      assertU(adoc("id", String.valueOf(i), TEST_FIELD, String.valueOf(i)));
+      assertU(adoc(ID_FIELD, String.valueOf(i), TEST_FIELD, String.valueOf(i)));
       
       if(rand.nextBoolean()) {
         assertU(commit());
@@ -86,7 +90,7 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
     
     assertU(commit());
     
-    withNewRawReader(topReader -> {
+    withNewRawReader(h, topReader -> {
       assertEquals(110, topReader.numDocs());
 
       final FieldInfos infos = MultiFields.getMergedFieldInfos(topReader);
@@ -99,7 +103,7 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
     
     
     // Assert all docs have the right docvalues
-    withNewRawReader( topReader -> {
+    withNewRawReader(h, topReader -> {
       // Assert merged into one segment 
       assertEquals(110, topReader.numDocs());
       assertEquals(optimizeSegments, topReader.leaves().size());
@@ -118,9 +122,9 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
         for(int i = 0; i < r.numDocs(); ++i) {
           Document doc = r.document(i);
           String v = doc.getField(TEST_FIELD).stringValue();
-          String id = doc.getField("id").stringValue();
+          String id = doc.getField(ID_FIELD).stringValue();
           assertEquals(DocValuesType.SORTED, r.getFieldInfos().fieldInfo(TEST_FIELD).getDocValuesType());
-          assertEquals(DocValuesType.NONE, r.getFieldInfos().fieldInfo("id").getDocValuesType());
+          assertEquals(DocValuesType.NONE, r.getFieldInfos().fieldInfo(ID_FIELD).getDocValuesType());
           assertEquals(v, id);
           
           docvalues.nextDoc();
@@ -135,28 +139,19 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
   // The field will be merged, docvalues headers updated, but no docvalues for this field
   public void testNonIndexedFieldDoesNonFail() throws Exception {
     // Remove Indexed from fieldType
-    try (SolrCore core = h.getCoreInc()) {
-
-      // remove indexed from the field type
-      IndexSchema schema = core.getLatestSchema();
-      SchemaField oldField = schema.getField(TEST_FIELD);
-      int newProperties = oldField.getProperties() ^ 0x00000001; //FieldProperties.INDEXED
-
-      SchemaField sf = new SchemaField(TEST_FIELD, oldField.getType(), newProperties, null);
-      schema.getFields().put(TEST_FIELD, sf);
-    }
+    removeIndexFrom(h, TEST_FIELD);
     
-    assertU(adoc("id", String.valueOf(1), TEST_FIELD, String.valueOf(1)));
+    assertU(adoc(ID_FIELD, String.valueOf(1), TEST_FIELD, String.valueOf(1)));
     assertU(commit());
     
-    addDocValuesTo(TEST_FIELD);
+    addDocValuesTo(h, TEST_FIELD);
     
-    assertU(adoc("id", String.valueOf(2), TEST_FIELD, String.valueOf(2)));
+    assertU(adoc(ID_FIELD, String.valueOf(2), TEST_FIELD, String.valueOf(2)));
     assertU(commit());
     
     assertU(optimize("maxSegments", "1"));
     
-    withNewRawReader( topReader -> {
+    withNewRawReader(h, topReader -> {
       // Assert merged into one segment 
       assertEquals(2, topReader.numDocs());
       assertEquals(1, topReader.leaves().size());
@@ -172,9 +167,9 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
         for(int i = 0; i < r.numDocs(); ++i) {
           Document doc = r.document(i);
           String v = doc.getField(TEST_FIELD).stringValue();
-          String id = doc.getField("id").stringValue();
+          String id = doc.getField(ID_FIELD).stringValue();
           assertEquals(DocValuesType.SORTED, r.getFieldInfos().fieldInfo(TEST_FIELD).getDocValuesType());
-          assertEquals(DocValuesType.NONE, r.getFieldInfos().fieldInfo("id").getDocValuesType());
+          assertEquals(DocValuesType.NONE, r.getFieldInfos().fieldInfo(ID_FIELD).getDocValuesType());
           
          
           if(id.equals("2")) {
@@ -190,16 +185,26 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
   }
 
   
-  private void addDocValuesTo(String field) {
+  private static void addDocValuesTo(TestHarness h, String fieldName) {
+    implUpdateSchemaField(h, fieldName, (p) -> (p | 0x00008000)); // FieldProperties.DOC_VALUES
+  }
+
+  private static void removeIndexFrom(TestHarness h, String fieldName) {
+    implUpdateSchemaField(h, fieldName, (p) -> (p ^ 0x00000001)); // FieldProperties.INDEXED
+  }
+
+  private static void implUpdateSchemaField(TestHarness h, String fieldName, IntUnaryOperator propertiesModifier) {
     try (SolrCore core = h.getCoreInc()) {
 
       // Add docvalues to the field type
       IndexSchema schema = core.getLatestSchema();
-      SchemaField oldField = schema.getField(field);
-      int newProperties = oldField.getProperties() | 0x00008000; //FieldProperties.DOC_VALUES
-
-      SchemaField sf = new SchemaField(field, oldField.getType(), newProperties, null);
-      schema.getFields().put(field, sf);
+      SchemaField oldSchemaField = schema.getField(fieldName);
+      SchemaField newSchemaField = new SchemaField(
+          fieldName,
+          oldSchemaField.getType(),
+          propertiesModifier.applyAsInt(oldSchemaField.getProperties()),
+          oldSchemaField.getDefaultValue());
+      schema.getFields().put(fieldName, newSchemaField);
     }
   }
   
@@ -207,7 +212,7 @@ public class UninvertDocValuesMergePolicyTest extends SolrTestCaseJ4 {
     public void accept(DirectoryReader consumer) throws Exception;
   }
 
-  private void withNewRawReader(DirectoryReaderConsumer consumer) {
+  private static void withNewRawReader(TestHarness h, DirectoryReaderConsumer consumer) {
     try (SolrCore core = h.getCoreInc()) {
       final RefCounted<SolrIndexSearcher> searcherRef = core.openNewSearcher(true, true);
       final SolrIndexSearcher searcher = searcherRef.get();

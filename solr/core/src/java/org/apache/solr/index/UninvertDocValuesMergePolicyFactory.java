@@ -30,7 +30,6 @@ import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.FilterCodecReader;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.MergePolicy;
-import org.apache.lucene.index.MergePolicy.OneMerge;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.OneMergeWrappingMergePolicy;
 import org.apache.lucene.index.SegmentCommitInfo;
@@ -42,8 +41,27 @@ import org.apache.solr.schema.IndexSchema;
 import org.apache.solr.schema.SchemaField;
 import org.apache.solr.uninverting.UninvertingReader;
 
+/**
+ * TODO: short class-level javadocs here
+ */
 public class UninvertDocValuesMergePolicyFactory extends WrapperMergePolicyFactory {
   
+  private boolean skipIntegrityCheck = false; // TODO: determine name and default value
+
+  /**
+   * TODO: javadocs
+   */
+  public boolean getSkipIntegrityCheck() {
+    return skipIntegrityCheck;
+  }
+
+  /**
+   * TODO: javadocs
+   */
+  public void setSkipIntegrityCheck(boolean skipIntegrityCheck) {
+    this.skipIntegrityCheck = skipIntegrityCheck;
+  }
+
   public UninvertDocValuesMergePolicyFactory(SolrResourceLoader resourceLoader, MergePolicyFactoryArgs args, IndexSchema schema) {
     super(resourceLoader, args, schema);
     if (!args.keys().isEmpty()) {
@@ -56,17 +74,20 @@ public class UninvertDocValuesMergePolicyFactory extends WrapperMergePolicyFacto
     return new OneMergeWrappingMergePolicy(wrappedMP, (merge) -> new UninvertDocValuesOneMerge(merge.segments));
   }
   
-  private boolean fieldNeedsUninvertedDocValues(FieldInfo fi) {
+  private UninvertingReader.Type getUninversionType(FieldInfo fi) {
     SchemaField sf = schema.getFieldOrNull(fi.name);
     
-    return null != sf && 
-           sf.hasDocValues() &&
-           fi.getDocValuesType() == DocValuesType.NONE && 
-           fi.getIndexOptions() != IndexOptions.NONE;
-
+    if (null != sf &&
+        sf.hasDocValues() &&
+        fi.getDocValuesType() == DocValuesType.NONE &&
+        fi.getIndexOptions() != IndexOptions.NONE) {
+      return sf.getType().getUninversionType(sf);
+    } else {
+      return null;
+    }
   }
     
-  private class UninvertDocValuesOneMerge extends OneMerge {
+  private class UninvertDocValuesOneMerge extends MergePolicy.OneMerge {
 
     public UninvertDocValuesOneMerge(List<SegmentCommitInfo> segments) {
       super(segments);
@@ -78,17 +99,20 @@ public class UninvertDocValuesMergePolicyFactory extends WrapperMergePolicyFacto
       // Schema says there should be
       
       
-      Map<String,UninvertingReader.Type> uninversionMap = new HashMap<>();
+      Map<String,UninvertingReader.Type> uninversionMap = null;
       
       for(FieldInfo fi: reader.getFieldInfos()) {
-        if(fieldNeedsUninvertedDocValues(fi)) {
-          SchemaField sf = schema.getFieldOrNull(fi.name);
-          uninversionMap.put(fi.name, sf.getType().getUninversionType(sf));
+        final UninvertingReader.Type type = getUninversionType(fi);
+        if (type != null) {
+          if (uninversionMap == null) {
+            uninversionMap = new HashMap<>();
+          }
+          uninversionMap.put(fi.name, type);
         }
         
       }
       
-      if(uninversionMap.isEmpty()) {
+      if(uninversionMap == null) {
         return reader; // Default to normal reader if nothing to uninvert
       } else {
         return new UninvertingFilterCodecReader(reader, uninversionMap);
@@ -106,56 +130,66 @@ public class UninvertDocValuesMergePolicyFactory extends WrapperMergePolicyFacto
    * fieldcache
    */
   private class UninvertingFilterCodecReader extends FilterCodecReader {
+
     private final UninvertingReader uninvertingReader;
-    
-    private final DocValuesProducer docValuesProducer = new DocValuesProducer() {
+    private final DocValuesProducer docValuesProducer;
 
-      @Override
-      public NumericDocValues getNumeric(FieldInfo field) throws IOException {  
-        return uninvertingReader.getNumericDocValues(field.name);
-      }
-
-      @Override
-      public BinaryDocValues getBinary(FieldInfo field) throws IOException {
-        return uninvertingReader.getBinaryDocValues(field.name);
-      }
-
-      @Override
-      public SortedDocValues getSorted(FieldInfo field) throws IOException {
-        return uninvertingReader.getSortedDocValues(field.name);
-      }
-
-      @Override
-      public SortedNumericDocValues getSortedNumeric(FieldInfo field) throws IOException {
-        return uninvertingReader.getSortedNumericDocValues(field.name);
-      }
-
-      @Override
-      public SortedSetDocValues getSortedSet(FieldInfo field) throws IOException {
-        return uninvertingReader.getSortedSetDocValues(field.name);
-      }
-
-      @Override
-      public void checkIntegrity() throws IOException {
-        // We already checkIntegrity the entire reader up front
-      }
-
-      @Override
-      public void close() {
-      }
-
-      @Override
-      public long ramBytesUsed() {
-        return 0;
-      }
-    };
-    
     public UninvertingFilterCodecReader(CodecReader in, Map<String,UninvertingReader.Type> uninversionMap) {
       super(in);
 
       this.uninvertingReader = new UninvertingReader(in, uninversionMap);
+      this.docValuesProducer = new DocValuesProducer() {
+
+        @Override
+        public NumericDocValues getNumeric(FieldInfo field) throws IOException {
+          return uninvertingReader.getNumericDocValues(field.name);
+        }
+
+        @Override
+        public BinaryDocValues getBinary(FieldInfo field) throws IOException {
+          return uninvertingReader.getBinaryDocValues(field.name);
+        }
+
+        @Override
+        public SortedDocValues getSorted(FieldInfo field) throws IOException {
+          return uninvertingReader.getSortedDocValues(field.name);
+        }
+
+        @Override
+        public SortedNumericDocValues getSortedNumeric(FieldInfo field) throws IOException {
+          return uninvertingReader.getSortedNumericDocValues(field.name);
+        }
+
+        @Override
+        public SortedSetDocValues getSortedSet(FieldInfo field) throws IOException {
+          return uninvertingReader.getSortedSetDocValues(field.name);
+        }
+
+        @Override
+        public void checkIntegrity() throws IOException {
+          if (!skipIntegrityCheck) {
+            uninvertingReader.checkIntegrity();
+          }
+        }
+
+        @Override
+        public void close() throws IOException {
+        }
+
+        @Override
+        public long ramBytesUsed() {
+          return 0;
+        }
+      };
     }
     
+    @Override
+    protected void doClose() throws IOException {
+      docValuesProducer.close();
+      uninvertingReader.close();
+      super.doClose();
+    }
+
     @Override
     public DocValuesProducer getDocValuesReader() {
       return docValuesProducer;
