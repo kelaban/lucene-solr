@@ -18,17 +18,19 @@ package org.apache.lucene.index;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.function.UnaryOperator;
 
+/**
+ * A wrapping merge policy that wraps the {@link org.apache.lucene.index.MergePolicy.OneMerge}
+ * objects returned by the wrapped merge policy.
+ *
+ * @lucene.experimental
+ */
 public class OneMergeWrappingMergePolicy extends MergePolicyWrapper {
-  
-  @FunctionalInterface
-  public interface WrapOneMerge {
-    public OneMerge wrap(OneMerge merge);
-  }
-  
-  private final WrapOneMerge wrapOneMerge;
 
-  public OneMergeWrappingMergePolicy(MergePolicy in, WrapOneMerge wrapOneMerge) {
+  private final UnaryOperator<OneMerge> wrapOneMerge;
+
+  public OneMergeWrappingMergePolicy(MergePolicy in, UnaryOperator<OneMerge> wrapOneMerge) {
     super(in);
     
     this.wrapOneMerge = wrapOneMerge;
@@ -57,7 +59,7 @@ public class OneMergeWrappingMergePolicy extends MergePolicyWrapper {
     MergeSpecification wrapped = spec == null ? null : new MergeSpecification();
     if (wrapped != null) {      
       for (OneMerge merge : spec.merges) {
-        wrapped.add(wrapOneMerge.wrap(merge));
+        wrapped.add(wrapOneMerge.apply(merge));
       }
     }
     return wrapped;
